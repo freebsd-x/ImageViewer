@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
 
         auto hdr = std::make_shared<TextWidget>("Image Info", 13.0f);
         hdr->setColor(Color{0.9f, 0.9f, 0.9f, 1.0f});
-        info_col->addChild(std::make_shared<ContainerWidget>(4.0f, 0.0f, hdr));
+        info_col->addChild([&]{ auto c = std::make_shared<FlexColumn>(std::vector<std::shared_ptr<Widget>>{hdr}); c->setPadding(4.0f); return c; }());
         info_col->addChild(std::make_shared<DividerWidget>());
 
         info_col->addChild(row("File",  basename(path)));
