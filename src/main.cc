@@ -554,7 +554,7 @@ int main(int argc, char** argv) {
 
     // Placeholder before any image is loaded
     auto placeholder = std::make_shared<TextWidget>("Drop an image or open a file", 14.0f);
-    placeholder->setColor(Color{0.35f, 0.35f, 0.38f, 1.0f});
+    placeholder->setColor(Color{0.56f, 0.56f, 0.60f, 1.0f});   // ≥ 4.5:1 on the dark canvas
     img_area->addChild(placeholder);
 
     // ── EXIF sidebar ──────────────────────────────────────────────────────────
