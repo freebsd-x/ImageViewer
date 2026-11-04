@@ -4,15 +4,20 @@
 //   • Pinch-to-zoom (GestureDetectorWidget) and pan with bounds clamping
 //   • Keyboard: Left/Right arrows = prev/next, +/- = zoom, Space = slideshow toggle
 //   • Slideshow mode: auto-advance on configurable interval (default 4 s)
-//   • Directory scanner: loads all images from the same folder as the opened file
+//   • Folder browsing: a file passed at launch brings its folder's images with it;
+//     one picked later is shown alone, since the sandbox gets only that file
 //   • Collapsible EXIF/metadata sidebar (Make, Model, DateTime, dimensions, file size)
 //   • EXIF parsed inline from JPEG APP1 and PNG IHDR/tEXt chunks — no extra deps
 //   • MIME handler for image/jpeg, image/png, image/gif, image/webp, image/*
-//   • Opens via argv[1], drag-and-drop, or LaunchWithFile XBus broadcast
+//   • Opens via argv[1], the Open button, or a drop (which asks through the picker)
+//   • Decodes through FFmpeg from a descriptor: no path is opened after start-up
 
 #include "xkit/widget.h"
 #include "xkit/application.h"
 #include "xkit/xbus_client.h"
+#include "xkit/file_dialog.h"
+#include "xkit/media_file.h"
+#include "xrender/svg_engine.h"
 #include "shared/protocol.h"
 #include <memory>
 #include <string>
@@ -30,7 +35,9 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
-#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/capsicum.h>
 
 namespace fs = std::filesystem;
 using namespace fbx::xkit;
@@ -57,10 +64,8 @@ static std::string basename(const std::string& path) {
 
 // ── File size helper ──────────────────────────────────────────────────────────
 
-static std::string fileSizeStr(const std::string& path) {
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0) return "?";
-    double sz = static_cast<double>(st.st_size);
+static std::string fileSizeStr(size_t bytes) {
+    double sz = static_cast<double>(bytes);
     if (sz < 1024)        return std::to_string(static_cast<int>(sz)) + " B";
     if (sz < 1024*1024)   return std::to_string(static_cast<int>(sz/1024)) + " KB";
     char buf[32];
@@ -174,12 +179,10 @@ static uint32_t parseTiffIfd(const uint8_t* base, uint32_t ifd_off,
 }
 
 // Parse JPEG file: find APP1 for EXIF, SOF0/SOF2 for dimensions
-static ExifInfo parseJpeg(const std::string& path) {
+static ExifInfo parseJpeg(const std::string& bytes) {
     ExifInfo info;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return info;
-    std::vector<uint8_t> data(std::istreambuf_iterator<char>(f), {});
-    size_t len = data.size();
+    const auto* data = reinterpret_cast<const uint8_t*>(bytes.data());
+    size_t len = bytes.size();
     if (len < 4 || data[0] != 0xFF || data[1] != 0xD8) return info;
 
     size_t pos = 2;
@@ -216,10 +219,9 @@ static ExifInfo parseJpeg(const std::string& path) {
 }
 
 // Parse PNG file: IHDR for dimensions, tEXt/iTXt for metadata
-static ExifInfo parsePng(const std::string& path) {
+static ExifInfo parsePng(const std::string& bytes) {
     ExifInfo info;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return info;
+    std::istringstream f(bytes);
     uint8_t sig[8];
     f.read(reinterpret_cast<char*>(sig), 8);
     if (f.gcount() < 8) return info;
@@ -233,6 +235,7 @@ static ExifInfo parsePng(const std::string& path) {
         uint32_t chunk_len = ((uint32_t)hdr[0]<<24)|((uint32_t)hdr[1]<<16)|
                              ((uint32_t)hdr[2]<<8) | hdr[3];
         char type[5]{}; std::memcpy(type, hdr+4, 4);
+        if (chunk_len > bytes.size()) break;   // a damaged length, not a real chunk
         std::vector<uint8_t> chunk(chunk_len);
         f.read(reinterpret_cast<char*>(chunk.data()), chunk_len);
         f.ignore(4); // CRC
@@ -257,13 +260,13 @@ static ExifInfo parsePng(const std::string& path) {
     return info;
 }
 
-static ExifInfo parseExif(const std::string& path) {
+static ExifInfo parseExif(const std::string& path, const std::string& bytes) {
     std::string lower = path;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
     if (lower.ends_with(".jpg") || lower.ends_with(".jpeg"))
-        return parseJpeg(path);
+        return parseJpeg(bytes);
     if (lower.ends_with(".png"))
-        return parsePng(path);
+        return parsePng(bytes);
     ExifInfo info;
     return info; // unsupported format — caller shows just filename
 }
@@ -298,28 +301,71 @@ int main(int argc, char** argv) {
     static std::function<void()>      start_slideshow;
     static std::function<void()>      stop_slideshow;
 
-    // ── Scan directory for sibling images ─────────────────────────────────────
-    [[maybe_unused]] auto scan_dir = [](const std::string& file_path) {
-        files.clear();
-        file_idx = 0;
-        fs::path p(file_path);
-        fs::path dir = p.parent_path();
-        if (dir.empty()) dir = ".";
-        try {
-            std::vector<std::string> found;
-            for (auto& entry : fs::directory_iterator(dir)) {
-                if (entry.is_regular_file() && isImageFile(entry.path().string()))
-                    found.push_back(entry.path().string());
-            }
-            std::sort(found.begin(), found.end());
-            files = std::move(found);
-            // Find index of our file
-            for (int i = 0; i < (int)files.size(); ++i) {
-                if (files[i] == file_path) { file_idx = i; break; }
-            }
-        } catch (...) {
-            files.push_back(file_path);
+    // ── Where the images come from ────────────────────────────────────────────
+    // The folder of a file given at launch (opened before the sandbox, and
+    // limited to reading what's in it), or the one file picked afterwards.
+    static int dir_fd = -1;
+    static fbx::xserver::UniqueFd picked_fd;
+
+    static std::string loaded_path;     // what the fields below hold
+    static std::string loaded_bytes;
+    static std::vector<uint8_t> loaded_pixels;
+    static uint32_t loaded_w = 0, loaded_h = 0;
+    static std::string load_error;
+
+    static auto load_image = [](const std::string& path) {
+        loaded_path = path;
+        loaded_pixels.clear();
+        loaded_bytes.clear();
+        load_error.clear();
+
+        fbx::xserver::UniqueFd sibling;
+        int fd = picked_fd.get();
+        if (fd < 0) {
+            sibling = fbx::xserver::UniqueFd(::openat(dir_fd, basename(path).c_str(), O_RDONLY | O_CLOEXEC));
+            fd = sibling.get();
         }
+        if (fd < 0) { load_error = std::strerror(errno); return; }
+        if (!readAllFd(fd, loaded_bytes)) { load_error = "couldn't read the file"; return; }
+
+        std::string lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.ends_with(".svg")) {
+            auto svg = fbx::xrender::SvgEngine::decode(loaded_bytes, 1024, 768);
+            if (!svg) { load_error = "the SVG couldn't be drawn"; return; }
+            loaded_pixels = std::move(svg->pixels_);
+            loaded_w = svg->width_;
+            loaded_h = svg->height_;
+            return;
+        }
+        (void)decodeImageFd(fd, basename(path), loaded_pixels, loaded_w, loaded_h, load_error);
+    };
+
+    // Show the file `index` of `found`, giving up what was shown before.
+    static auto show_files = [](std::vector<std::string> found, const std::string& current) {
+        stop_slideshow();
+        files = std::move(found);
+        file_idx = 0;
+        for (int i = 0; i < (int)files.size(); ++i)
+            if (files[i] == current) { file_idx = i; break; }
+        loaded_path.clear();
+        open_index(file_idx);
+        XApplication::setTitle(std::string("Image Viewer — ") + basename(current));
+    };
+
+    // Past start-up the sandbox opens no paths: the user picks, in the shell.
+    static auto pick_image = [](const std::string& folder) {
+        auto* bus = XApplication::getBus();
+        if (!bus) return;
+        XFileDialog::pickToOpen(*bus, "Open Image", folder, [](XFileDialog::Picked p) {
+            if (p.cancelled) return;
+            if (!p.fd) {
+                if (filename_lbl) filename_lbl->setText("Couldn't open that file: " + p.error);
+                return;
+            }
+            picked_fd = std::move(p.fd);
+            show_files({p.path}, p.path);
+        });
     };
 
     // ── Rebuild EXIF sidebar ──────────────────────────────────────────────────
@@ -343,7 +389,7 @@ int main(int argc, char** argv) {
 
         if (files.empty()) return;
         const std::string& path = files[file_idx];
-        ExifInfo ex = parseExif(path);
+        ExifInfo ex = parseExif(path, loaded_bytes);
 
         auto hdr = std::make_shared<TextWidget>("Image Info", 13.0f);
         hdr->setColor(Color{0.9f, 0.9f, 0.9f, 1.0f});
@@ -351,7 +397,7 @@ int main(int argc, char** argv) {
         info_col->addChild(std::make_shared<DividerWidget>());
 
         info_col->addChild(row("File",  basename(path)));
-        info_col->addChild(row("Size",  fileSizeStr(path)));
+        info_col->addChild(row("Size",  fileSizeStr(loaded_bytes.size())));
         if (ex.width && ex.height) {
             info_col->addChild(row("Dims",
                 std::to_string(ex.width) + " × " + std::to_string(ex.height)));
@@ -375,7 +421,9 @@ int main(int argc, char** argv) {
         pan_x_ = 0.0f;
         pan_y_ = 0.0f;
 
-        const std::string& path = files[file_idx];
+        const std::string path = files[file_idx];
+        // Zooming and panning come back here; only a different file is read.
+        if (path != loaded_path) load_image(path);
 
         if (filename_lbl) filename_lbl->setText(basename(path));
         if (counter_lbl)
@@ -386,13 +434,22 @@ int main(int argc, char** argv) {
         // Rebuild image display
         if (img_area) {
             img_area->clearChildren();
+            if (loaded_pixels.empty()) {
+                auto msg = std::make_shared<TextWidget>(
+                    "Can't show " + basename(path) + ": " + load_error, 14.0f);
+                msg->setColor(Color{0.95f, 0.60f, 0.55f, 1.0f});
+                img_area->addChild(msg);
+                if (info_open_) rebuild_info();
+                return;
+            }
 
             // Display image at 800×600 base, scaled
             constexpr float kBaseW = 800.0f, kBaseH = 600.0f;
             float disp_w = kBaseW * scale_;
             float disp_h = kBaseH * scale_;
 
-            auto img = std::make_shared<ImageWidget>(path);
+            auto img = std::make_shared<ImageWidget>(loaded_pixels, loaded_w, loaded_h);
+            img->setFitMode(ImageFitMode::Contain);
             img->setFixedSize(disp_w, disp_h);
             img->setMargin(pan_y_ < 0 ? -pan_y_ : 0.0f,
                            pan_x_ < 0 ? -pan_x_ : 0.0f,
@@ -517,7 +574,13 @@ int main(int argc, char** argv) {
         });
     info_btn->setBackgroundColor(Color{0.18f, 0.18f, 0.20f, 1.0f});
 
+    auto open_btn = std::make_shared<ButtonWidget>(
+        std::make_shared<TextWidget>(" Open… ", 12.0f), []() { pick_image(""); });
+    open_btn->setBackgroundColor(Color{0.18f, 0.18f, 0.20f, 1.0f});
+
     auto toolbar = std::make_shared<FlexRow>(std::vector<std::shared_ptr<Widget>>{
+        open_btn,
+        std::make_shared<Spacer>(8, 0),
         prev_btn,
         std::make_shared<Spacer>(4, 0),
         next_btn,
@@ -553,7 +616,7 @@ int main(int argc, char** argv) {
     img_area->setBackgroundColor(Color{0.08f, 0.08f, 0.09f, 1.0f});
 
     // Placeholder before any image is loaded
-    auto placeholder = std::make_shared<TextWidget>("Drop an image or open a file", 14.0f);
+    auto placeholder = std::make_shared<TextWidget>("Open an image, or drop one here", 14.0f);
     placeholder->setColor(Color{0.56f, 0.56f, 0.60f, 1.0f});   // ≥ 4.5:1 on the dark canvas
     img_area->addChild(placeholder);
 
@@ -613,30 +676,8 @@ int main(int argc, char** argv) {
             reg_mime("image/gif");
             reg_mime("image/webp");
 
-            // LaunchWithFile broadcast
-            xbus.OnBroadcast([](const XBusMessage& msg) {
-                if (std::strcmp(msg.service_name_, "com.freebsdx.Shell") != 0) return;
-                if (msg.opcode_ !=
-                    static_cast<uint32_t>(ShellOpcode::LaunchWithFile)) return;
-                ShellLaunchRequest req{};
-                std::memcpy(&req, msg.payload_, sizeof(req));
-                req.app_id_[sizeof(req.app_id_) - 1]     = '\0';
-                req.file_path_[sizeof(req.file_path_) - 1] = '\0';
-                if (std::strcmp(req.app_id_, "com.freebsdx.imageviewer") == 0 &&
-                    req.file_path_[0] != '\0' && isImageFile(req.file_path_)) {
-                    stop_slideshow();
-                    // scan_dir is a lambda captured by ref from outer scope —
-                    // call via free function alias
-                    files.clear();
-                    files.push_back(req.file_path_);
-                    file_idx = 0;
-                    open_index(0);
-                    XApplication::setTitle(
-                        std::string("Image Viewer — ") + basename(req.file_path_));
-                }
-            });
-
-            // Drag-and-drop from Files app
+            // A drop carries a path this sandbox can't open: ask for it through
+            // the picker, starting in its folder.
             XApplication::setOnDrop("text/uri-list",
                 [](float, float, const std::string& data) {
                     std::string path = data;
@@ -644,51 +685,30 @@ int main(int argc, char** argv) {
                            (path.back() == '\n' || path.back() == '\r'))
                         path.pop_back();
                     if (path.starts_with("file://")) path = path.substr(7);
-                    if (!path.empty() && isImageFile(path)) {
-                        stop_slideshow();
-                        // Scan directory and open
-                        files.clear();
-                        fs::path dir = fs::path(path).parent_path();
-                        try {
-                            std::vector<std::string> found;
-                            for (auto& e : fs::directory_iterator(dir))
-                                if (e.is_regular_file() && isImageFile(e.path()))
-                                    found.push_back(e.path().string());
-                            std::sort(found.begin(), found.end());
-                            files = std::move(found);
-                            file_idx = 0;
-                            for (int i = 0; i < (int)files.size(); ++i)
-                                if (files[i] == path) { file_idx = i; break; }
-                        } catch (...) {
-                            files.push_back(path);
-                        }
-                        open_index(file_idx);
-                        XApplication::setTitle(
-                            std::string("Image Viewer — ") + basename(path));
-                    }
+                    if (!path.empty() && isImageFile(path))
+                        pick_image(fs::path(path).parent_path().string());
                 });
 
-            // Pre-load from command line
+            // The file from the command line, and the rest of its folder. This
+            // runs before the sandbox starts, the one time a path can be opened.
             if (!preload.empty() && isImageFile(preload)) {
-                // scan directory for siblings
                 fs::path dir = fs::path(preload).parent_path();
                 if (dir.empty()) dir = ".";
-                try {
-                    std::vector<std::string> found;
-                    for (auto& e : fs::directory_iterator(dir))
-                        if (e.is_regular_file() && isImageFile(e.path()))
-                            found.push_back(e.path().string());
-                    std::sort(found.begin(), found.end());
-                    files = std::move(found);
-                    file_idx = 0;
-                    for (int i = 0; i < (int)files.size(); ++i)
-                        if (files[i] == preload) { file_idx = i; break; }
-                } catch (...) {
-                    files.push_back(preload);
+                dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                if (dir_fd >= 0) {
+                    cap_rights_t rights;
+                    cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_SEEK, CAP_FSTAT);
+                    (void)cap_rights_limit(dir_fd, &rights);
                 }
-                open_index(file_idx);
-                XApplication::setTitle(
-                    std::string("Image Viewer — ") + basename(preload));
+                std::vector<std::string> found;
+                std::error_code ec;
+                for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+                    if (it->is_regular_file(ec) && isImageFile(it->path()))
+                        found.push_back(it->path().string());
+                std::sort(found.begin(), found.end());
+                if (std::find(found.begin(), found.end(), preload) == found.end())
+                    found.push_back(preload);
+                show_files(std::move(found), preload);
             }
         });
 }
